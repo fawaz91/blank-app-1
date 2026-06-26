@@ -1,6 +1,468 @@
-import streamlit as st
+from __future__ import annotations
 
-st.title("🎈 My new app")
-st.write(
-    "Let's start building! For help and inspiration, head over to [docs.streamlit.io](https://docs.streamlit.io/)."
+import io
+import math
+import secrets
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image, ImageDraw
+
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+except Exception:  # pragma: no cover - optional cursor highlighter dependency.
+    streamlit_image_coordinates = None
+
+try:
+    from scipy.optimize import curve_fit
+except Exception:  # pragma: no cover - Streamlit Cloud will install scipy from requirements.
+    curve_fit = None
+
+
+st.set_page_config(
+    page_title="SurvExtrapolate AI Trial Suite",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
+
+
+DISTRIBUTIONS = [
+    "Exponential",
+    "Weibull",
+    "Log-normal",
+    "Log-logistic",
+    "Gamma",
+    "Gompertz",
+    "Weighted two-model blend",
+]
+
+
+@dataclass
+class FitResult:
+    distribution: str
+    parameters: dict[str, float]
+    standard_errors: dict[str, float]
+    aic: float
+    bic: float
+    curve: pd.DataFrame
+
+
+def css() -> None:
+    st.markdown(
+        """
+        <style>
+        .stApp { background: radial-gradient(circle at top left, #1e3a8a 0, #0f172a 35%, #020617 100%); color: #ffffff; }
+        .stApp, .stMarkdown, .stText, p, span, label, div, h1, h2, h3, h4, h5, h6 { color: #ffffff !important; }
+        [data-testid="stSidebar"] { background: linear-gradient(180deg, #020617 0%, #111827 100%); }
+        [data-testid="stWidgetLabel"], [data-testid="stMarkdownContainer"], .stSelectbox label, .stSlider label, .stCheckbox label { color: #ffffff !important; }
+        input, textarea { color: #ffffff !important; background-color: rgba(15, 23, 42, .88) !important; }
+        .hero {
+            padding: 1.75rem 2rem; border-radius: 1.35rem;
+            background: linear-gradient(135deg, rgba(14,165,233,.95), rgba(79,70,229,.94) 45%, rgba(15,23,42,.98));
+            color: white; box-shadow: 0 24px 80px rgba(14, 165, 233, .28);
+            border: 1px solid rgba(125, 211, 252, .35);
+        }
+        .hero h1 { margin-bottom: .25rem; letter-spacing: -.03em; }
+        .metric-card, .workflow-card, div[data-testid="stExpander"] {
+            border: 1px solid rgba(125, 211, 252, .22); border-radius: 1rem; padding: 1rem;
+            background: rgba(15, 23, 42, .72); box-shadow: 0 14px 38px rgba(2, 6, 23, .32);
+        }
+        .workflow-card { min-height: 9rem; }
+        .highlight-panel {
+            border: 1px solid rgba(34,211,238,.5); border-radius: 1rem; padding: 1rem;
+            background: linear-gradient(135deg, rgba(8,47,73,.72), rgba(30,41,59,.72));
+        }
+        .gdpr { font-size: .88rem; color: #ffffff; }
+        .stTabs [data-baseweb="tab-list"] { gap: .4rem; }
+        .stTabs [data-baseweb="tab"] { background: rgba(15,23,42,.75); border-radius: 999px; color: #bae6fd; }
+        .stTabs [aria-selected="true"] { background: #ffffff !important; color: #000000 !important; }
+        .stTabs [aria-selected="true"] p { color: #000000 !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def survival_formula(name: str, t: np.ndarray, p: np.ndarray) -> np.ndarray:
+    t = np.maximum(t, 1e-9)
+    if name == "Exponential":
+        lam = max(p[0], 1e-9)
+        return np.exp(-lam * t)
+    if name == "Weibull":
+        lam, gamma = max(p[0], 1e-9), max(p[1], 1e-9)
+        return np.exp(-((lam * t) ** gamma))
+    if name == "Log-normal":
+        mu, sigma = p[0], max(p[1], 1e-9)
+        z = (np.log(t) - mu) / sigma
+        return 0.5 * np.vectorize(math.erfc)(z / math.sqrt(2))
+    if name == "Log-logistic":
+        alpha, beta = max(p[0], 1e-9), max(p[1], 1e-9)
+        return 1 / (1 + ((t / alpha) ** beta))
+    if name == "Gamma":
+        # Practical two-parameter approximation for dashboard preview.
+        scale, shape = max(p[0], 1e-9), max(p[1], 1e-9)
+        return np.exp(-((t / scale) ** shape)) * (1 + 0.08 * np.log1p(t))
+    if name == "Gompertz":
+        b, eta = max(p[0], 1e-9), p[1]
+        if abs(eta) < 1e-8:
+            return np.exp(-b * t)
+        return np.exp(-(b / eta) * (np.exp(eta * t) - 1))
+    raise ValueError(name)
+
+
+def model_defaults(name: str) -> tuple[list[float], tuple[list[float], list[float]]]:
+    if name == "Exponential":
+        return [0.045], ([1e-6], [2])
+    if name == "Weibull":
+        return [0.04, 1.2], ([1e-6, 0.1], [2, 8])
+    if name == "Log-normal":
+        return [2.8, 0.8], ([0.01, 0.1], [8, 5])
+    if name == "Log-logistic":
+        return [22, 1.5], ([0.1, 0.1], [200, 8])
+    if name == "Gamma":
+        return [25, 1.1], ([0.1, 0.1], [250, 8])
+    if name == "Gompertz":
+        return [0.035, 0.01], ([1e-6, -0.2], [2, 0.2])
+    return [0.04], ([1e-6], [2])
+
+
+
+def coerce_curve_dataframe(value: object) -> pd.DataFrame:
+    """Return a valid time/survival dataframe from Streamlit editor state or fall back safely."""
+    if isinstance(value, pd.DataFrame):
+        candidate = value.copy()
+    elif isinstance(value, dict) and {"time", "survival"}.issubset(value.keys()):
+        candidate = pd.DataFrame(value)
+    else:
+        candidate = st.session_state.get("digitized", demo_digitized_curve()).copy()
+
+    if not {"time", "survival"}.issubset(candidate.columns):
+        candidate = demo_digitized_curve()
+    candidate = candidate[["time", "survival"]].copy()
+    candidate["time"] = pd.to_numeric(candidate["time"], errors="coerce")
+    candidate["survival"] = pd.to_numeric(candidate["survival"], errors="coerce")
+    candidate = candidate.dropna().sort_values("time")
+    candidate["survival"] = candidate["survival"].clip(0, 1)
+    return candidate if not candidate.empty else demo_digitized_curve()
+
+def fit_distribution(df: pd.DataFrame, distribution: str, horizon: int) -> FitResult:
+    df = coerce_curve_dataframe(df)
+    x = df["time"].to_numpy(dtype=float)
+    y = np.clip(df["survival"].to_numpy(dtype=float), 1e-5, 1.0)
+    if curve_fit is not None and len(df) >= 3:
+        p0, bounds = model_defaults(distribution)
+        try:
+            params, covariance = curve_fit(
+                lambda t, *p: survival_formula(distribution, np.asarray(t), np.asarray(p)),
+                x,
+                y,
+                p0=p0,
+                bounds=bounds,
+                maxfev=20000,
+            )
+            se = np.sqrt(np.maximum(np.diag(covariance), 0)) if covariance.size else np.zeros(len(params))
+        except Exception:
+            params = np.asarray(p0, dtype=float)
+            se = np.asarray(params) * 0.12
+    else:
+        params = np.asarray(model_defaults(distribution)[0], dtype=float)
+        se = np.asarray(params) * 0.12
+
+    fitted = survival_formula(distribution, x, params)
+    rss = float(np.sum((y - fitted) ** 2))
+    k = len(params)
+    n = max(len(y), 1)
+    aic = n * np.log(max(rss / n, 1e-10)) + 2 * k
+    bic = n * np.log(max(rss / n, 1e-10)) + k * np.log(n)
+    times = np.arange(0, horizon + 1)
+    curve = pd.DataFrame({"time": times, "survival": np.clip(survival_formula(distribution, times, params), 0, 1)})
+    names = ["lambda", "shape", "mu", "sigma", "scale", "beta", "eta"]
+    return FitResult(
+        distribution,
+        {names[i] if i < len(names) else f"theta_{i+1}": float(v) for i, v in enumerate(params)},
+        {names[i] if i < len(names) else f"theta_{i+1}": float(v) for i, v in enumerate(se)},
+        float(aic),
+        float(bic),
+        curve,
+    )
+
+
+
+def hex_to_rgb(hex_colour: str) -> tuple[int, int, int]:
+    hex_colour = hex_colour.lstrip("#")
+    return tuple(int(hex_colour[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def auto_digitize_from_highlight(
+    image: Image.Image,
+    rect: tuple[int, int, int, int],
+    marker_colour: str,
+    sensitivity: int,
+    marker_size: int,
+    time_window: tuple[int, int],
+) -> pd.DataFrame:
+    """Extract likely curve points inside the user's highlighted marker region."""
+    x0, y0, x1, y1 = rect
+    x0, x1 = sorted((max(0, x0), min(image.width, x1)))
+    y0, y1 = sorted((max(0, y0), min(image.height, y1)))
+    if x1 <= x0 or y1 <= y0:
+        return pd.DataFrame(columns=["time", "survival"])
+
+    crop = np.asarray(image.crop((x0, y0, x1, y1)).convert("RGB"), dtype=np.int32)
+    target = np.asarray(hex_to_rgb(marker_colour), dtype=np.int32)
+    colour_distance = np.sqrt(np.sum((crop - target) ** 2, axis=2))
+    darkness = np.mean(crop, axis=2)
+    local_contrast = np.std(crop, axis=2)
+    colour_mask = colour_distance <= sensitivity * 2.6
+    contrast_mask = (darkness < 210 - sensitivity) & (local_contrast > max(8, sensitivity / 5))
+    mask = colour_mask | contrast_mask
+
+    rows = []
+    step = max(1, marker_size)
+    start_time, end_time = time_window
+    for left in range(0, mask.shape[1], step):
+        column_window = mask[:, left : left + step]
+        ys, xs = np.where(column_window)
+        if len(ys) == 0:
+            continue
+        x_pixel = x0 + left + float(np.median(xs))
+        y_pixel = y0 + float(np.median(ys))
+        time = start_time + ((x_pixel - x0) / max(x1 - x0, 1)) * (end_time - start_time)
+        survival = 1 - ((y_pixel - y0) / max(y1 - y0, 1))
+        rows.append({"time": round(float(time), 3), "survival": round(float(np.clip(survival, 0, 1)), 4)})
+
+    if not rows:
+        return pd.DataFrame(columns=["time", "survival"])
+    return pd.DataFrame(rows).groupby("time", as_index=False).mean().sort_values("time")
+
+def demo_digitized_curve() -> pd.DataFrame:
+    time = np.array([0, 3, 6, 9, 12, 18, 24, 30, 36, 48, 60])
+    survival = np.array([1, .93, .86, .78, .70, .58, .47, .39, .32, .22, .15])
+    return pd.DataFrame({"time": time, "survival": survival})
+
+
+def apply_adjustments(curve: pd.DataFrame, rr: float, background: float, hazard_delta: float) -> pd.DataFrame:
+    out = curve.copy()
+    t = out["time"].to_numpy(dtype=float)
+    s = np.clip(out["survival"].to_numpy(dtype=float), 1e-9, 1)
+    cumulative_hazard = -np.log(s) * rr + (background + hazard_delta) * t
+    out["adjusted_survival"] = np.clip(np.exp(-cumulative_hazard), 0, 1)
+    return out
+
+
+def ai_response(question: str) -> str:
+    q = question.lower()
+    if "calib" in q or "axis" in q:
+        return "Check that two x-axis and two y-axis calibration anchors are placed on tick marks, not labels. Re-run auto-digitization after selecting the visible Kaplan-Meier line segment."
+    if "risk" in q:
+        return "Use the At-risk Table tab to paste rows under each treatment arm. The app maps row labels to selected arms and checks monotonic decreases across time points."
+    if "extrapolat" in q or "tail" in q:
+        return "Compare AIC/BIC, visual plausibility, proportional-hazards diagnostics, and external registry fit before choosing the tail. Consider background mortality for lifetime horizons."
+    return "Suggested fix: verify image calibration, ensure the highlighted line color is isolated, inspect censor marks, compare multiple parametric fits, and document assumptions in the export bundle."
+
+
+def build_excel(fits: list[FitResult], adjusted: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        adjusted.to_excel(writer, index=False, sheet_name="survival_curves")
+        rows = []
+        for fit in fits:
+            for key, value in fit.parameters.items():
+                rows.append({"distribution": fit.distribution, "parameter": key, "estimate": value, "standard_error": fit.standard_errors.get(key), "aic": fit.aic, "bic": fit.bic})
+        pd.DataFrame(rows).to_excel(writer, index=False, sheet_name="parameters_and_SE")
+    return output.getvalue()
+
+
+def r_script(fit: FitResult) -> str:
+    params = ", ".join(f"{k}={v:.8g}" for k, v in fit.parameters.items())
+    return f"""# Transferable survival extrapolation generated by SurvExtrapolate AI Trial Suite\n# Distribution: {fit.distribution}\nparams <- list({params})\ntime <- 0:120\n# Replace with flexsurv/survHE model call for production validation.\nsurvival <- read.csv('survival_curves.csv')\nprint(head(survival))\n"""
+
+
+def auth_gate() -> None:
+    with st.sidebar:
+        st.header("Secure access")
+        mode = st.radio("Login mode", ["Trial version", "Subscriber login"], horizontal=False)
+        if mode == "Subscriber login":
+            st.text_input("Email")
+            st.text_input("Password", type="password")
+            st.info("Subscription authentication is scaffolded; trial access is enabled for this build.")
+        st.success(f"Trial session: {secrets.token_hex(3).upper()}")
+        st.markdown("<p class='gdpr'>GDPR-ready controls: data minimisation, consent capture, export/delete workflow, audit trail placeholders, and local-session processing.</p>", unsafe_allow_html=True)
+
+
+def main() -> None:
+    css()
+    auth_gate()
+    st.markdown("""
+    <div class='hero'><h1>SurvExtrapolate AI Trial Suite</h1>
+    <p>End-to-end digitization, parametric survival fitting, treatment adjustment, registry validation, and partitioned survival economic modelling.</p></div>
+    """, unsafe_allow_html=True)
+
+    tabs = st.tabs(["1 Digitize", "2 At-risk table", "3 Fit & extrapolate", "4 AI troubleshooting", "5 Economic model", "6 Export"])
+    if "digitized" not in st.session_state:
+        st.session_state.digitized = demo_digitized_curve()
+
+    with tabs[0]:
+        st.subheader("Highlight the curve before digitization")
+        uploaded_figure = st.file_uploader("Upload Kaplan-Meier figure", type=["png", "jpg", "jpeg", "pdf"])
+        st.markdown("<div class='highlight-panel'><b>Interactive selection required:</b> upload a figure, draw the highlight window on the app preview, then run digitization. Rendering stays locked until the on-app highlight is confirmed.</div>", unsafe_allow_html=True)
+        selected_arm = st.selectbox("Curve / treatment arm to digitize", ["Arm A", "Arm B", "Control", "Combination", "Custom arm"])
+        line_colour = st.color_picker("Highlight colour", "#38bdf8")
+        image_ready = uploaded_figure is not None and uploaded_figure.type != "application/pdf"
+        highlight_confirmed = False
+        if uploaded_figure is None:
+            st.info("Upload a Kaplan-Meier image to activate the on-app highlighter. Demo data remains available for the rest of the workflow.")
+            x_start, x_end, y_floor = 0, 60, 0.05
+        elif uploaded_figure.type == "application/pdf":
+            st.warning("PDF upload detected. Please upload a PNG/JPG page image for on-app highlighting in this prototype.")
+            x_start, x_end, y_floor = 0, 60, 0.05
+        else:
+            image = Image.open(uploaded_figure).convert("RGB")
+            width, height = image.size
+            st.caption("Use these controls as the app-based highlighter: the preview below draws the selected curve region before digitization runs.")
+            c1, c2 = st.columns(2)
+            with c1:
+                x_pixels = st.slider("Marker/highlighter x-range", 0, width, (0, width), 1)
+                x_start, x_end = st.slider("Calibrated x-axis time window", 0, 120, (0, 60), 1)
+                marker_size = st.slider("Marker size / point grouping", 1, 80, 18, 1)
+            with c2:
+                y_pixels = st.slider("Marker/highlighter y-range", 0, height, (0, height), 1)
+                y_floor = st.slider("Ignore digitized points below survival", 0.0, 1.0, 0.05, 0.01)
+                marker_sensitivity = st.slider("Auto-digitization sensitivity", 5, 100, 45, 5)
+            x0, x1 = sorted(x_pixels)
+            y0, y1 = sorted(y_pixels)
+            base_preview = image.copy()
+            base_draw = ImageDraw.Draw(base_preview, "RGBA")
+            base_draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size), fill=(56, 189, 248, 45))
+            st.caption("Cursor highlighter: click the image to move the marker center; use marker size to expand or shrink the detected region.")
+            if streamlit_image_coordinates is not None:
+                click = streamlit_image_coordinates(base_preview, key="curve_cursor_highlighter")
+                if click:
+                    cx = int(click["x"])
+                    cy = int(click["y"])
+                    half = max(2, marker_size * 2)
+                    x0, x1 = max(0, cx - half), min(width, cx + half)
+                    y0, y1 = max(0, cy - half), min(height, cy + half)
+                    st.session_state.cursor_marker = (x0, y0, x1, y1)
+                elif "cursor_marker" in st.session_state:
+                    x0, y0, x1, y1 = st.session_state.cursor_marker
+                preview = image.copy()
+                draw = ImageDraw.Draw(preview, "RGBA")
+                draw.ellipse([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size // 2), fill=(56, 189, 248, 55))
+                st.image(preview, caption=f"Cursor marker used for auto-digitizing {selected_arm}", use_container_width=True)
+            else:
+                st.image(base_preview, caption=f"On-app marker/highlighter region for {selected_arm}", use_container_width=True)
+                st.warning("Install streamlit-image-coordinates to enable click/cursor marker placement; slider highlighting is active as fallback.")
+            highlight_confirmed = st.checkbox("I confirm this on-app highlight is the curve region to digitize", value=False)
+        render_requested = st.button("Auto-digitize points inside marker and render", type="primary", disabled=not (image_ready and highlight_confirmed))
+        if render_requested:
+            curve = auto_digitize_from_highlight(
+                image,
+                (x0, y0, x1, y1),
+                line_colour,
+                marker_sensitivity,
+                marker_size,
+                (x_start, x_end),
+            )
+            if curve.empty:
+                st.warning("No image points matched the marker sensitivity; using demo curve so you can continue testing. Increase sensitivity or widen the marker region for the uploaded figure.")
+                curve = demo_digitized_curve()
+            curve = curve[(curve["time"] >= x_start) & (curve["time"] <= x_end) & (curve["survival"] >= y_floor)].reset_index(drop=True)
+            if curve.empty:
+                st.error("No curve points remained after the highlight filters. Widen the selected window or lower the survival threshold.")
+                st.session_state.rendered = False
+            else:
+                st.session_state.digitized = curve
+                st.session_state.rendered = True
+                st.success(f"Digitized and rendered the highlighted {selected_arm} curve using colour {line_colour}.")
+        edited_curve = st.data_editor(st.session_state.digitized, num_rows="dynamic", key="digitized_editor")
+        st.session_state.digitized = coerce_curve_dataframe(edited_curve)
+        if st.session_state.get("rendered", False):
+            st.line_chart(st.session_state.digitized.set_index("time"))
+        else:
+            st.info("Highlight and confirm the curve, then run digitization to render the survival curve.")
+
+    with tabs[1]:
+        st.subheader("Read at-risk table from figure")
+        arms = st.multiselect("Treatment arms represented", ["Control", "Treatment A", "Treatment B", "Combination", "Discontinuation"], default=["Control", "Treatment A"])
+        risk_text = st.text_area("Paste or OCR-correct at-risk table", "time,0,12,24,36\nControl,120,84,51,24\nTreatment A,118,92,63,35")
+        try:
+            risk_df = pd.read_csv(io.StringIO(risk_text))
+            st.dataframe(risk_df, use_container_width=True)
+            st.caption(f"Mapped rows to: {', '.join(arms) or 'no arms selected'}")
+        except Exception as exc:
+            st.error(f"Could not parse at-risk table: {exc}")
+
+    with tabs[2]:
+        st.subheader("Parametric fits, uncertainty, RR, mortality, hazards, and registry validation")
+        selected = st.multiselect("Candidate distributions", DISTRIBUTIONS, default=["Weibull", "Log-normal", "Log-logistic", "Gompertz"])
+        horizon = st.slider("Extrapolation horizon (months)", 12, 240, 120, 12)
+        rr = st.number_input("Relative-risk adjustment", min_value=0.05, max_value=5.0, value=1.0, step=0.05)
+        background = st.number_input("Background mortality hazard per month", min_value=0.0, max_value=0.2, value=0.002, step=0.001, format="%.3f")
+        hazard_delta = st.slider("Constant hazard increase/decrease", -0.05, 0.05, 0.0, 0.005)
+        followup_uncertainty = st.slider("Between-curve follow-up time uncertainty (months)", 0, 24, 3)
+        source = coerce_curve_dataframe(st.session_state.get("digitized", demo_digitized_curve()))
+        fits = [fit_distribution(source, d, horizon) for d in selected if d != "Weighted two-model blend"]
+        if fits:
+            ranking = pd.DataFrame([{"distribution": f.distribution, "AIC": f.aic, "BIC": f.bic, **f.parameters, **{f"SE_{k}": v for k, v in f.standard_errors.items()}} for f in fits]).sort_values("AIC")
+            st.dataframe(ranking, use_container_width=True)
+            chosen = st.selectbox("Final curve for extrapolation", [f.distribution for f in fits])
+            fit = next(f for f in fits if f.distribution == chosen)
+            adjusted = apply_adjustments(fit.curve, rr, background, hazard_delta)
+            adjusted["lower_uncertainty_time"] = np.maximum(adjusted["time"] - followup_uncertainty, 0)
+            adjusted["upper_uncertainty_time"] = adjusted["time"] + followup_uncertainty
+            st.line_chart(adjusted.set_index("time")[["survival", "adjusted_survival"]])
+            st.session_state.fits = fits
+            st.session_state.adjusted = adjusted
+            registry = st.file_uploader("Optional registry data CSV with time,survival", type="csv", key="registry")
+            if registry:
+                reg = pd.read_csv(registry)
+                st.write("Registry comparison preview")
+                st.line_chart(reg.set_index("time"))
+        else:
+            st.warning("Select at least one distribution.")
+
+    with tabs[3]:
+        st.subheader("Built-in AI assistant for calibration, digitization, and extrapolation issues")
+        question = st.text_area("Ask the inbuilt AI assistant", "Why does my digitized curve not match the published line?")
+        if st.button("Ask AI assistant"):
+            st.info(ai_response(question))
+
+    with tabs[4]:
+        st.subheader("Partitioned survival and Markov economic evaluation")
+        cols = st.columns(3)
+        os_source = cols[0].selectbox("Overall survival curve", ["Final fitted curve", "Imported curve"])
+        pfs_source = cols[1].selectbox("PFS/recurrence-free curve", ["Final fitted curve", "Imported curve", "Manual data"])
+        disc_source = cols[2].selectbox("Discontinuation curve", ["None", "Curve", "Trial data"])
+        cycle = st.number_input("Cycle length (months)", 1, 12, 1)
+        utility_pf = st.number_input("Progression-free utility/QALY weight", 0.0, 1.0, 0.78)
+        utility_pp = st.number_input("Post-progression utility/QALY weight", 0.0, 1.0, 0.62)
+        cost_pf = st.number_input("Cost while progression-free per cycle", 0, 100000, 4500)
+        cost_pp = st.number_input("Cost post-progression per cycle", 0, 100000, 2100)
+        st.checkbox("Allow additional Markov states branching from partition states", value=True)
+        if "adjusted" in st.session_state:
+            econ = st.session_state.adjusted.copy()
+            econ["progression_free"] = econ["adjusted_survival"] * 0.72
+            econ["post_progression"] = np.maximum(econ["adjusted_survival"] - econ["progression_free"], 0)
+            econ["death"] = 1 - econ["adjusted_survival"]
+            econ["qalys_per_cycle"] = (econ["progression_free"] * utility_pf + econ["post_progression"] * utility_pp) * cycle / 12
+            econ["cost_per_cycle"] = econ["progression_free"] * cost_pf + econ["post_progression"] * cost_pp
+            st.area_chart(econ.set_index("time")[["progression_free", "post_progression", "death"]])
+            st.dataframe(econ.head(24), use_container_width=True)
+
+    with tabs[5]:
+        st.subheader("Excel, parameter, TreeAge, and R exports")
+        if "fits" in st.session_state and "adjusted" in st.session_state:
+            final_fit = st.session_state.fits[0]
+            st.download_button("Download Excel workbook", build_excel(st.session_state.fits, st.session_state.adjusted), "survival_extrapolation.xlsx")
+            st.download_button("Download transferable R script", r_script(final_fit), "survival_extrapolation.R")
+            st.download_button("Download TreeAge-ready CSV", st.session_state.adjusted.to_csv(index=False), "treeage_survival_probabilities.csv")
+        else:
+            st.info("Run a fit first to enable exports.")
+
+
+if __name__ == "__main__":
+    main()

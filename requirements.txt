@@ -1,1 +1,7 @@
 streamlit
+pandas
+numpy
+scipy
+xlsxwriter
+pillow
+streamlit-image-coordinates
