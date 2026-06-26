@@ -73,6 +73,8 @@ def css() -> None:
         .gdpr { font-size: .88rem; color: #ffffff; }
         .stTabs [data-baseweb="tab-list"] { gap: .4rem; }
         .stTabs [data-baseweb="tab"] { background: rgba(15,23,42,.75); border-radius: 999px; color: #bae6fd; }
+        .stTabs [aria-selected="true"] { background: #ffffff !important; color: #000000 !important; }
+        .stTabs [aria-selected="true"] p { color: #000000 !important; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -163,6 +165,54 @@ def fit_distribution(df: pd.DataFrame, distribution: str, horizon: int) -> FitRe
     )
 
 
+
+def hex_to_rgb(hex_colour: str) -> tuple[int, int, int]:
+    hex_colour = hex_colour.lstrip("#")
+    return tuple(int(hex_colour[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def auto_digitize_from_highlight(
+    image: Image.Image,
+    rect: tuple[int, int, int, int],
+    marker_colour: str,
+    sensitivity: int,
+    marker_size: int,
+    time_window: tuple[int, int],
+) -> pd.DataFrame:
+    """Extract likely curve points inside the user's highlighted marker region."""
+    x0, y0, x1, y1 = rect
+    x0, x1 = sorted((max(0, x0), min(image.width, x1)))
+    y0, y1 = sorted((max(0, y0), min(image.height, y1)))
+    if x1 <= x0 or y1 <= y0:
+        return pd.DataFrame(columns=["time", "survival"])
+
+    crop = np.asarray(image.crop((x0, y0, x1, y1)).convert("RGB"), dtype=np.int32)
+    target = np.asarray(hex_to_rgb(marker_colour), dtype=np.int32)
+    colour_distance = np.sqrt(np.sum((crop - target) ** 2, axis=2))
+    darkness = np.mean(crop, axis=2)
+    local_contrast = np.std(crop, axis=2)
+    colour_mask = colour_distance <= sensitivity * 2.6
+    contrast_mask = (darkness < 210 - sensitivity) & (local_contrast > max(8, sensitivity / 5))
+    mask = colour_mask | contrast_mask
+
+    rows = []
+    step = max(1, marker_size)
+    start_time, end_time = time_window
+    for left in range(0, mask.shape[1], step):
+        column_window = mask[:, left : left + step]
+        ys, xs = np.where(column_window)
+        if len(ys) == 0:
+            continue
+        x_pixel = x0 + left + float(np.median(xs))
+        y_pixel = y0 + float(np.median(ys))
+        time = start_time + ((x_pixel - x0) / max(x1 - x0, 1)) * (end_time - start_time)
+        survival = 1 - ((y_pixel - y0) / max(y1 - y0, 1))
+        rows.append({"time": round(float(time), 3), "survival": round(float(np.clip(survival, 0, 1)), 4)})
+
+    if not rows:
+        return pd.DataFrame(columns=["time", "survival"])
+    return pd.DataFrame(rows).groupby("time", as_index=False).mean().sort_values("time")
+
 def demo_digitized_curve() -> pd.DataFrame:
     time = np.array([0, 3, 6, 9, 12, 18, 24, 30, 36, 48, 60])
     survival = np.array([1, .93, .86, .78, .70, .58, .47, .39, .32, .22, .15])
@@ -250,21 +300,33 @@ def main() -> None:
             st.caption("Use these controls as the app-based highlighter: the preview below draws the selected curve region before digitization runs.")
             c1, c2 = st.columns(2)
             with c1:
-                x_pixels = st.slider("Highlight x-range on uploaded figure", 0, width, (0, width), 1)
+                x_pixels = st.slider("Marker/highlighter x-range", 0, width, (0, width), 1)
                 x_start, x_end = st.slider("Calibrated x-axis time window", 0, 120, (0, 60), 1)
+                marker_size = st.slider("Marker size / point grouping", 1, 30, 6, 1)
             with c2:
-                y_pixels = st.slider("Highlight y-range on uploaded figure", 0, height, (0, height), 1)
+                y_pixels = st.slider("Marker/highlighter y-range", 0, height, (0, height), 1)
                 y_floor = st.slider("Ignore digitized points below survival", 0.0, 1.0, 0.05, 0.01)
+                marker_sensitivity = st.slider("Auto-digitization sensitivity", 5, 100, 45, 5)
             preview = image.copy()
             draw = ImageDraw.Draw(preview, "RGBA")
             x0, x1 = sorted(x_pixels)
             y0, y1 = sorted(y_pixels)
-            draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=6, fill=(56, 189, 248, 45))
-            st.image(preview, caption=f"On-app highlighted region for {selected_arm}", use_container_width=True)
+            draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size), fill=(56, 189, 248, 45))
+            st.image(preview, caption=f"On-app marker/highlighter region for {selected_arm}", use_container_width=True)
             highlight_confirmed = st.checkbox("I confirm this on-app highlight is the curve region to digitize", value=False)
-        render_requested = st.button("Digitize highlighted curve and render", type="primary", disabled=not (image_ready and highlight_confirmed))
+        render_requested = st.button("Auto-digitize points inside marker and render", type="primary", disabled=not (image_ready and highlight_confirmed))
         if render_requested:
-            curve = demo_digitized_curve()
+            curve = auto_digitize_from_highlight(
+                image,
+                (x0, y0, x1, y1),
+                line_colour,
+                marker_sensitivity,
+                marker_size,
+                (x_start, x_end),
+            )
+            if curve.empty:
+                st.warning("No image points matched the marker sensitivity; using demo curve so you can continue testing. Increase sensitivity or widen the marker region for the uploaded figure.")
+                curve = demo_digitized_curve()
             curve = curve[(curve["time"] >= x_start) & (curve["time"] <= x_end) & (curve["survival"] >= y_floor)].reset_index(drop=True)
             if curve.empty:
                 st.error("No curve points remained after the highlight filters. Widen the selected window or lower the survival threshold.")
