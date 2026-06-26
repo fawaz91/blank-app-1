@@ -11,6 +11,11 @@ import streamlit as st
 from PIL import Image, ImageDraw
 
 try:
+    from streamlit_drawable_canvas import st_canvas
+except Exception:  # pragma: no cover - optional shaded-area highlighter dependency.
+    st_canvas = None
+
+try:
     from streamlit_image_coordinates import streamlit_image_coordinates
 except Exception:  # pragma: no cover - optional cursor highlighter dependency.
     streamlit_image_coordinates = None
@@ -191,6 +196,28 @@ def fit_distribution(df: pd.DataFrame, distribution: str, horizon: int) -> FitRe
 
 
 
+
+def canvas_highlight_bbox(canvas_result: object, scale_x: float, scale_y: float) -> tuple[int, int, int, int] | None:
+    """Read the user's shaded canvas area and return an image-space bounding box."""
+    if canvas_result is None or not getattr(canvas_result, "json_data", None):
+        return None
+    objects = canvas_result.json_data.get("objects", [])
+    if not objects:
+        return None
+    obj = objects[-1]
+    left = float(obj.get("left", 0))
+    top = float(obj.get("top", 0))
+    width = float(obj.get("width", 0)) * float(obj.get("scaleX", 1))
+    height = float(obj.get("height", 0)) * float(obj.get("scaleY", 1))
+    if width <= 0 or height <= 0:
+        return None
+    return (
+        int(left * scale_x),
+        int(top * scale_y),
+        int((left + width) * scale_x),
+        int((top + height) * scale_y),
+    )
+
 def hex_to_rgb(hex_colour: str) -> tuple[int, int, int]:
     hex_colour = hex_colour.lstrip("#")
     return tuple(int(hex_colour[i : i + 2], 16) for i in (0, 2, 4))
@@ -337,8 +364,34 @@ def main() -> None:
             base_preview = image.copy()
             base_draw = ImageDraw.Draw(base_preview, "RGBA")
             base_draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size), fill=(56, 189, 248, 45))
-            st.caption("Cursor highlighter: click the image to move the marker center; use marker size to expand or shrink the detected region.")
-            if streamlit_image_coordinates is not None:
+            st.caption("Shade the curve area directly on the uploaded image. Auto-digitization searches only inside the latest shaded region.")
+            if st_canvas is not None:
+                canvas_width = min(width, 900)
+                scale = canvas_width / max(width, 1)
+                canvas_height = max(1, int(height * scale))
+                canvas_image = image.resize((canvas_width, canvas_height))
+                canvas_result = st_canvas(
+                    fill_color="rgba(56, 189, 248, 0.28)",
+                    stroke_width=max(2, marker_size),
+                    stroke_color=line_colour,
+                    background_image=canvas_image,
+                    update_streamlit=True,
+                    height=canvas_height,
+                    width=canvas_width,
+                    drawing_mode="rect",
+                    key="curve_shaded_area_canvas",
+                )
+                shaded_bbox = canvas_highlight_bbox(canvas_result, width / canvas_width, height / canvas_height)
+                if shaded_bbox is not None:
+                    x0, y0, x1, y1 = shaded_bbox
+                    st.session_state.cursor_marker = shaded_bbox
+                elif "cursor_marker" in st.session_state:
+                    x0, y0, x1, y1 = st.session_state.cursor_marker
+                preview = image.copy()
+                draw = ImageDraw.Draw(preview, "RGBA")
+                draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size), fill=(56, 189, 248, 45))
+                st.image(preview, caption=f"Shaded area used for auto-digitizing {selected_arm}", use_container_width=True)
+            elif streamlit_image_coordinates is not None:
                 click = streamlit_image_coordinates(base_preview, key="curve_cursor_highlighter")
                 if click:
                     cx = int(click["x"])
@@ -355,7 +408,7 @@ def main() -> None:
                 st.image(preview, caption=f"Cursor marker used for auto-digitizing {selected_arm}", use_container_width=True)
             else:
                 st.image(base_preview, caption=f"On-app marker/highlighter region for {selected_arm}", use_container_width=True)
-                st.warning("Install streamlit-image-coordinates to enable click/cursor marker placement; slider highlighting is active as fallback.")
+                st.warning("Install streamlit-drawable-canvas for shaded-area highlighting; slider highlighting is active as fallback.")
             highlight_confirmed = st.checkbox("I confirm this on-app highlight is the curve region to digitize", value=False)
         render_requested = st.button("Auto-digitize points inside marker and render", type="primary", disabled=not (image_ready and highlight_confirmed))
         if render_requested:

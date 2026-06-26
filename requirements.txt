@@ -5,3 +5,4 @@ scipy
 xlsxwriter
 pillow
 streamlit-image-coordinates
+streamlit-drawable-canvas
