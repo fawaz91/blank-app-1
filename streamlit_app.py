@@ -349,7 +349,13 @@ def main() -> None:
         else:
             image = Image.open(uploaded_figure).convert("RGB")
             width, height = image.size
-            st.caption("Use these controls as the app-based highlighter: the preview below draws the selected curve region before digitization runs.")
+            highlighter_mode = st.radio(
+                "Highlighting method",
+                ["Manual shaded region (recommended)", "Draw/cursor highlighter (experimental)"],
+                horizontal=True,
+                help="Manual mode always works: adjust the shaded rectangle yourself, then auto-digitization searches inside it.",
+            )
+            st.caption("Manual highlighter: adjust the shaded region on the uploaded image, then auto-digitization searches only inside that region.")
             c1, c2 = st.columns(2)
             with c1:
                 x_pixels = st.slider("Marker/highlighter x-range", 0, width, (0, width), 1)
@@ -364,8 +370,13 @@ def main() -> None:
             base_preview = image.copy()
             base_draw = ImageDraw.Draw(base_preview, "RGBA")
             base_draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size), fill=(56, 189, 248, 45))
-            st.caption("Shade the curve area directly on the uploaded image. Auto-digitization searches only inside the latest shaded region.")
-            if st_canvas is not None:
+            if highlighter_mode == "Manual shaded region (recommended)":
+                preview = image.copy()
+                draw = ImageDraw.Draw(preview, "RGBA")
+                draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size), fill=(56, 189, 248, 45))
+                st.image(preview, caption=f"Manual shaded region used for auto-digitizing {selected_arm}", use_container_width=True)
+                st.info("Manual mode is active: drag the x/y range sliders until the shaded box covers the curve, then confirm and run auto-digitization.")
+            elif st_canvas is not None:
                 canvas_width = min(width, 900)
                 scale = canvas_width / max(width, 1)
                 canvas_height = max(1, int(height * scale))
@@ -435,6 +446,15 @@ def main() -> None:
                 st.session_state.digitized = curve
                 st.session_state.rendered = True
                 st.success(f"Digitized and rendered the highlighted {selected_arm} curve using colour {line_colour}.")
+        with st.expander("Manual digitized points entry", expanded=False):
+            manual_points = st.text_area("Paste manual points as CSV: time,survival", "time,survival\n0,1\n12,0.70\n24,0.47\n36,0.32")
+            if st.button("Use pasted manual points"):
+                try:
+                    st.session_state.digitized = coerce_curve_dataframe(pd.read_csv(io.StringIO(manual_points)))
+                    st.session_state.rendered = True
+                    st.success("Manual points loaded and rendered.")
+                except Exception as exc:
+                    st.error(f"Could not parse manual points: {exc}")
         edited_curve = st.data_editor(st.session_state.digitized, num_rows="dynamic", key="digitized_editor")
         st.session_state.digitized = coerce_curve_dataframe(edited_curve)
         if st.session_state.get("rendered", False):
