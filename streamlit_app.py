@@ -4,9 +4,11 @@ import io
 import math
 import secrets
 from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 import streamlit as st
+from PIL import Image, ImageDraw
 
 try:
     from scipy.optimize import curve_fit
@@ -47,8 +49,11 @@ def css() -> None:
     st.markdown(
         """
         <style>
-        .stApp { background: radial-gradient(circle at top left, #1e3a8a 0, #0f172a 35%, #020617 100%); color: #e2e8f0; }
+        .stApp { background: radial-gradient(circle at top left, #1e3a8a 0, #0f172a 35%, #020617 100%); color: #ffffff; }
+        .stApp, .stMarkdown, .stText, p, span, label, div, h1, h2, h3, h4, h5, h6 { color: #ffffff !important; }
         [data-testid="stSidebar"] { background: linear-gradient(180deg, #020617 0%, #111827 100%); }
+        [data-testid="stWidgetLabel"], [data-testid="stMarkdownContainer"], .stSelectbox label, .stSlider label, .stCheckbox label { color: #ffffff !important; }
+        input, textarea { color: #ffffff !important; background-color: rgba(15, 23, 42, .88) !important; }
         .hero {
             padding: 1.75rem 2rem; border-radius: 1.35rem;
             background: linear-gradient(135deg, rgba(14,165,233,.95), rgba(79,70,229,.94) 45%, rgba(15,23,42,.98));
@@ -65,7 +70,7 @@ def css() -> None:
             border: 1px solid rgba(34,211,238,.5); border-radius: 1rem; padding: 1rem;
             background: linear-gradient(135deg, rgba(8,47,73,.72), rgba(30,41,59,.72));
         }
-        .gdpr { font-size: .88rem; color: #cbd5e1; }
+        .gdpr { font-size: .88rem; color: #ffffff; }
         .stTabs [data-baseweb="tab-list"] { gap: .4rem; }
         .stTabs [data-baseweb="tab"] { background: rgba(15,23,42,.75); border-radius: 999px; color: #bae6fd; }
         </style>
@@ -227,18 +232,37 @@ def main() -> None:
 
     with tabs[0]:
         st.subheader("Highlight the curve before digitization")
-        st.file_uploader("Upload Kaplan-Meier figure", type=["png", "jpg", "jpeg", "pdf"])
-        st.markdown("<div class='highlight-panel'><b>Interactive selection required:</b> choose the arm, line colour, and visible time window first. Rendering stays locked until you confirm the curve has been highlighted.</div>", unsafe_allow_html=True)
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            selected_arm = st.selectbox("Curve / treatment arm to digitize", ["Arm A", "Arm B", "Control", "Combination", "Custom arm"])
-            line_colour = st.color_picker("Highlighted curve colour", "#38bdf8")
-        with col2:
-            x_start, x_end = st.slider("Highlighted x-axis window", 0, 120, (0, 60), 1)
-            y_floor = st.slider("Ignore points below survival", 0.0, 1.0, 0.05, 0.01)
-        with col3:
-            highlight_confirmed = st.checkbox("I highlighted the curve to digitize", value=False)
-            render_requested = st.button("Digitize highlighted curve and render", type="primary", disabled=not highlight_confirmed)
+        uploaded_figure = st.file_uploader("Upload Kaplan-Meier figure", type=["png", "jpg", "jpeg", "pdf"])
+        st.markdown("<div class='highlight-panel'><b>Interactive selection required:</b> upload a figure, draw the highlight window on the app preview, then run digitization. Rendering stays locked until the on-app highlight is confirmed.</div>", unsafe_allow_html=True)
+        selected_arm = st.selectbox("Curve / treatment arm to digitize", ["Arm A", "Arm B", "Control", "Combination", "Custom arm"])
+        line_colour = st.color_picker("Highlight colour", "#38bdf8")
+        image_ready = uploaded_figure is not None and uploaded_figure.type != "application/pdf"
+        highlight_confirmed = False
+        if uploaded_figure is None:
+            st.info("Upload a Kaplan-Meier image to activate the on-app highlighter. Demo data remains available for the rest of the workflow.")
+            x_start, x_end, y_floor = 0, 60, 0.05
+        elif uploaded_figure.type == "application/pdf":
+            st.warning("PDF upload detected. Please upload a PNG/JPG page image for on-app highlighting in this prototype.")
+            x_start, x_end, y_floor = 0, 60, 0.05
+        else:
+            image = Image.open(uploaded_figure).convert("RGB")
+            width, height = image.size
+            st.caption("Use these controls as the app-based highlighter: the preview below draws the selected curve region before digitization runs.")
+            c1, c2 = st.columns(2)
+            with c1:
+                x_pixels = st.slider("Highlight x-range on uploaded figure", 0, width, (0, width), 1)
+                x_start, x_end = st.slider("Calibrated x-axis time window", 0, 120, (0, 60), 1)
+            with c2:
+                y_pixels = st.slider("Highlight y-range on uploaded figure", 0, height, (0, height), 1)
+                y_floor = st.slider("Ignore digitized points below survival", 0.0, 1.0, 0.05, 0.01)
+            preview = image.copy()
+            draw = ImageDraw.Draw(preview, "RGBA")
+            x0, x1 = sorted(x_pixels)
+            y0, y1 = sorted(y_pixels)
+            draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=6, fill=(56, 189, 248, 45))
+            st.image(preview, caption=f"On-app highlighted region for {selected_arm}", use_container_width=True)
+            highlight_confirmed = st.checkbox("I confirm this on-app highlight is the curve region to digitize", value=False)
+        render_requested = st.button("Digitize highlighted curve and render", type="primary", disabled=not (image_ready and highlight_confirmed))
         if render_requested:
             curve = demo_digitized_curve()
             curve = curve[(curve["time"] >= x_start) & (curve["time"] <= x_end) & (curve["survival"] >= y_floor)].reset_index(drop=True)
