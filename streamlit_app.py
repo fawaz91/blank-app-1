@@ -11,6 +11,11 @@ import streamlit as st
 from PIL import Image, ImageDraw
 
 try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+except Exception:  # pragma: no cover - optional cursor highlighter dependency.
+    streamlit_image_coordinates = None
+
+try:
     from scipy.optimize import curve_fit
 except Exception:  # pragma: no cover - Streamlit Cloud will install scipy from requirements.
     curve_fit = None
@@ -124,7 +129,27 @@ def model_defaults(name: str) -> tuple[list[float], tuple[list[float], list[floa
     return [0.04], ([1e-6], [2])
 
 
+
+def coerce_curve_dataframe(value: object) -> pd.DataFrame:
+    """Return a valid time/survival dataframe from Streamlit editor state or fall back safely."""
+    if isinstance(value, pd.DataFrame):
+        candidate = value.copy()
+    elif isinstance(value, dict) and {"time", "survival"}.issubset(value.keys()):
+        candidate = pd.DataFrame(value)
+    else:
+        candidate = st.session_state.get("digitized", demo_digitized_curve()).copy()
+
+    if not {"time", "survival"}.issubset(candidate.columns):
+        candidate = demo_digitized_curve()
+    candidate = candidate[["time", "survival"]].copy()
+    candidate["time"] = pd.to_numeric(candidate["time"], errors="coerce")
+    candidate["survival"] = pd.to_numeric(candidate["survival"], errors="coerce")
+    candidate = candidate.dropna().sort_values("time")
+    candidate["survival"] = candidate["survival"].clip(0, 1)
+    return candidate if not candidate.empty else demo_digitized_curve()
+
 def fit_distribution(df: pd.DataFrame, distribution: str, horizon: int) -> FitResult:
+    df = coerce_curve_dataframe(df)
     x = df["time"].to_numpy(dtype=float)
     y = np.clip(df["survival"].to_numpy(dtype=float), 1e-5, 1.0)
     if curve_fit is not None and len(df) >= 3:
@@ -302,17 +327,35 @@ def main() -> None:
             with c1:
                 x_pixels = st.slider("Marker/highlighter x-range", 0, width, (0, width), 1)
                 x_start, x_end = st.slider("Calibrated x-axis time window", 0, 120, (0, 60), 1)
-                marker_size = st.slider("Marker size / point grouping", 1, 30, 6, 1)
+                marker_size = st.slider("Marker size / point grouping", 1, 80, 18, 1)
             with c2:
                 y_pixels = st.slider("Marker/highlighter y-range", 0, height, (0, height), 1)
                 y_floor = st.slider("Ignore digitized points below survival", 0.0, 1.0, 0.05, 0.01)
                 marker_sensitivity = st.slider("Auto-digitization sensitivity", 5, 100, 45, 5)
-            preview = image.copy()
-            draw = ImageDraw.Draw(preview, "RGBA")
             x0, x1 = sorted(x_pixels)
             y0, y1 = sorted(y_pixels)
-            draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size), fill=(56, 189, 248, 45))
-            st.image(preview, caption=f"On-app marker/highlighter region for {selected_arm}", use_container_width=True)
+            base_preview = image.copy()
+            base_draw = ImageDraw.Draw(base_preview, "RGBA")
+            base_draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size), fill=(56, 189, 248, 45))
+            st.caption("Cursor highlighter: click the image to move the marker center; use marker size to expand or shrink the detected region.")
+            if streamlit_image_coordinates is not None:
+                click = streamlit_image_coordinates(base_preview, key="curve_cursor_highlighter")
+                if click:
+                    cx = int(click["x"])
+                    cy = int(click["y"])
+                    half = max(2, marker_size * 2)
+                    x0, x1 = max(0, cx - half), min(width, cx + half)
+                    y0, y1 = max(0, cy - half), min(height, cy + half)
+                    st.session_state.cursor_marker = (x0, y0, x1, y1)
+                elif "cursor_marker" in st.session_state:
+                    x0, y0, x1, y1 = st.session_state.cursor_marker
+                preview = image.copy()
+                draw = ImageDraw.Draw(preview, "RGBA")
+                draw.ellipse([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size // 2), fill=(56, 189, 248, 55))
+                st.image(preview, caption=f"Cursor marker used for auto-digitizing {selected_arm}", use_container_width=True)
+            else:
+                st.image(base_preview, caption=f"On-app marker/highlighter region for {selected_arm}", use_container_width=True)
+                st.warning("Install streamlit-image-coordinates to enable click/cursor marker placement; slider highlighting is active as fallback.")
             highlight_confirmed = st.checkbox("I confirm this on-app highlight is the curve region to digitize", value=False)
         render_requested = st.button("Auto-digitize points inside marker and render", type="primary", disabled=not (image_ready and highlight_confirmed))
         if render_requested:
@@ -336,8 +379,9 @@ def main() -> None:
                 st.session_state.rendered = True
                 st.success(f"Digitized and rendered the highlighted {selected_arm} curve using colour {line_colour}.")
         edited_curve = st.data_editor(st.session_state.digitized, num_rows="dynamic", key="digitized_editor")
+        st.session_state.digitized = coerce_curve_dataframe(edited_curve)
         if st.session_state.get("rendered", False):
-            st.line_chart(edited_curve.set_index("time"))
+            st.line_chart(st.session_state.digitized.set_index("time"))
         else:
             st.info("Highlight and confirm the curve, then run digitization to render the survival curve.")
 
@@ -360,7 +404,7 @@ def main() -> None:
         background = st.number_input("Background mortality hazard per month", min_value=0.0, max_value=0.2, value=0.002, step=0.001, format="%.3f")
         hazard_delta = st.slider("Constant hazard increase/decrease", -0.05, 0.05, 0.0, 0.005)
         followup_uncertainty = st.slider("Between-curve follow-up time uncertainty (months)", 0, 24, 3)
-        source = st.session_state.get("digitized_editor", st.session_state.digitized)
+        source = coerce_curve_dataframe(st.session_state.get("digitized", demo_digitized_curve()))
         fits = [fit_distribution(source, d, horizon) for d in selected if d != "Weighted two-model blend"]
         if fits:
             ranking = pd.DataFrame([{"distribution": f.distribution, "AIC": f.aic, "BIC": f.bic, **f.parameters, **{f"SE_{k}": v for k, v in f.standard_errors.items()}} for f in fits]).sort_values("AIC")
