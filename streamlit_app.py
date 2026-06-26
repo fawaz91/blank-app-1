@@ -370,27 +370,31 @@ def main() -> None:
                 scale = canvas_width / max(width, 1)
                 canvas_height = max(1, int(height * scale))
                 canvas_image = image.resize((canvas_width, canvas_height))
-                canvas_result = st_canvas(
-                    fill_color="rgba(56, 189, 248, 0.28)",
-                    stroke_width=max(2, marker_size),
-                    stroke_color=line_colour,
-                    background_image=canvas_image,
-                    update_streamlit=True,
-                    height=canvas_height,
-                    width=canvas_width,
-                    drawing_mode="rect",
-                    key="curve_shaded_area_canvas",
-                )
-                shaded_bbox = canvas_highlight_bbox(canvas_result, width / canvas_width, height / canvas_height)
-                if shaded_bbox is not None:
-                    x0, y0, x1, y1 = shaded_bbox
-                    st.session_state.cursor_marker = shaded_bbox
-                elif "cursor_marker" in st.session_state:
-                    x0, y0, x1, y1 = st.session_state.cursor_marker
-                preview = image.copy()
-                draw = ImageDraw.Draw(preview, "RGBA")
-                draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size), fill=(56, 189, 248, 45))
-                st.image(preview, caption=f"Shaded area used for auto-digitizing {selected_arm}", use_container_width=True)
+                try:
+                    canvas_result = st_canvas(
+                        fill_color="rgba(56, 189, 248, 0.28)",
+                        stroke_width=max(2, marker_size),
+                        stroke_color=line_colour,
+                        background_image=canvas_image,
+                        update_streamlit=True,
+                        height=canvas_height,
+                        width=canvas_width,
+                        drawing_mode="rect",
+                        key="curve_shaded_area_canvas",
+                    )
+                    shaded_bbox = canvas_highlight_bbox(canvas_result, width / canvas_width, height / canvas_height)
+                    if shaded_bbox is not None:
+                        x0, y0, x1, y1 = shaded_bbox
+                        st.session_state.cursor_marker = shaded_bbox
+                    elif "cursor_marker" in st.session_state:
+                        x0, y0, x1, y1 = st.session_state.cursor_marker
+                    preview = image.copy()
+                    draw = ImageDraw.Draw(preview, "RGBA")
+                    draw.rectangle([x0, y0, x1, y1], outline=line_colour, width=max(2, marker_size), fill=(56, 189, 248, 45))
+                    st.image(preview, caption=f"Shaded area used for auto-digitizing {selected_arm}", use_container_width=True)
+                except Exception as exc:
+                    st.warning(f"The shaded canvas highlighter is unavailable in this Streamlit environment ({exc.__class__.__name__}). Falling back to the slider/cursor marker without stopping the app.")
+                    st.image(base_preview, caption=f"Fallback marker region for auto-digitizing {selected_arm}", use_container_width=True)
             elif streamlit_image_coordinates is not None:
                 click = streamlit_image_coordinates(base_preview, key="curve_cursor_highlighter")
                 if click:
