@@ -47,22 +47,27 @@ def css() -> None:
     st.markdown(
         """
         <style>
-        .stApp { background: linear-gradient(180deg, #f7fbff 0%, #ffffff 45%); }
+        .stApp { background: radial-gradient(circle at top left, #1e3a8a 0, #0f172a 35%, #020617 100%); color: #e2e8f0; }
+        [data-testid="stSidebar"] { background: linear-gradient(180deg, #020617 0%, #111827 100%); }
         .hero {
-            padding: 1.5rem 1.75rem; border-radius: 1.25rem;
-            background: linear-gradient(135deg, #102a43 0%, #2563eb 55%, #38bdf8 100%);
-            color: white; box-shadow: 0 18px 45px rgba(15, 23, 42, .18);
+            padding: 1.75rem 2rem; border-radius: 1.35rem;
+            background: linear-gradient(135deg, rgba(14,165,233,.95), rgba(79,70,229,.94) 45%, rgba(15,23,42,.98));
+            color: white; box-shadow: 0 24px 80px rgba(14, 165, 233, .28);
+            border: 1px solid rgba(125, 211, 252, .35);
         }
-        .hero h1 { margin-bottom: .25rem; }
-        .metric-card {
-            border: 1px solid #dbeafe; border-radius: 1rem; padding: 1rem;
-            background: rgba(255,255,255,.86); box-shadow: 0 8px 24px rgba(37,99,235,.08);
+        .hero h1 { margin-bottom: .25rem; letter-spacing: -.03em; }
+        .metric-card, .workflow-card, div[data-testid="stExpander"] {
+            border: 1px solid rgba(125, 211, 252, .22); border-radius: 1rem; padding: 1rem;
+            background: rgba(15, 23, 42, .72); box-shadow: 0 14px 38px rgba(2, 6, 23, .32);
         }
-        .workflow-card {
-            min-height: 9rem; border: 1px solid #e2e8f0; border-radius: 1rem;
-            padding: 1rem; background: white;
+        .workflow-card { min-height: 9rem; }
+        .highlight-panel {
+            border: 1px solid rgba(34,211,238,.5); border-radius: 1rem; padding: 1rem;
+            background: linear-gradient(135deg, rgba(8,47,73,.72), rgba(30,41,59,.72));
         }
-        .gdpr { font-size: .88rem; color: #475569; }
+        .gdpr { font-size: .88rem; color: #cbd5e1; }
+        .stTabs [data-baseweb="tab-list"] { gap: .4rem; }
+        .stTabs [data-baseweb="tab"] { background: rgba(15,23,42,.75); border-radius: 999px; color: #bae6fd; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -221,17 +226,34 @@ def main() -> None:
         st.session_state.digitized = demo_digitized_curve()
 
     with tabs[0]:
-        st.subheader("Automatic digitization after line selection")
+        st.subheader("Highlight the curve before digitization")
         st.file_uploader("Upload Kaplan-Meier figure", type=["png", "jpg", "jpeg", "pdf"])
-        col1, col2 = st.columns(2)
+        st.markdown("<div class='highlight-panel'><b>Interactive selection required:</b> choose the arm, line colour, and visible time window first. Rendering stays locked until you confirm the curve has been highlighted.</div>", unsafe_allow_html=True)
+        col1, col2, col3 = st.columns(3)
         with col1:
-            st.selectbox("Selected/highlighted line", ["Arm A highlighted line", "Arm B highlighted line", "Custom highlighted segment"])
-            if st.button("Run auto-digitization and render curve", type="primary"):
-                st.session_state.digitized = demo_digitized_curve()
-                st.success("Digitization completed and rendered.")
+            selected_arm = st.selectbox("Curve / treatment arm to digitize", ["Arm A", "Arm B", "Control", "Combination", "Custom arm"])
+            line_colour = st.color_picker("Highlighted curve colour", "#38bdf8")
         with col2:
-            st.data_editor(st.session_state.digitized, num_rows="dynamic", key="digitized_editor")
-        st.line_chart(st.session_state.digitized.set_index("time"))
+            x_start, x_end = st.slider("Highlighted x-axis window", 0, 120, (0, 60), 1)
+            y_floor = st.slider("Ignore points below survival", 0.0, 1.0, 0.05, 0.01)
+        with col3:
+            highlight_confirmed = st.checkbox("I highlighted the curve to digitize", value=False)
+            render_requested = st.button("Digitize highlighted curve and render", type="primary", disabled=not highlight_confirmed)
+        if render_requested:
+            curve = demo_digitized_curve()
+            curve = curve[(curve["time"] >= x_start) & (curve["time"] <= x_end) & (curve["survival"] >= y_floor)].reset_index(drop=True)
+            if curve.empty:
+                st.error("No curve points remained after the highlight filters. Widen the selected window or lower the survival threshold.")
+                st.session_state.rendered = False
+            else:
+                st.session_state.digitized = curve
+                st.session_state.rendered = True
+                st.success(f"Digitized and rendered the highlighted {selected_arm} curve using colour {line_colour}.")
+        edited_curve = st.data_editor(st.session_state.digitized, num_rows="dynamic", key="digitized_editor")
+        if st.session_state.get("rendered", False):
+            st.line_chart(edited_curve.set_index("time"))
+        else:
+            st.info("Highlight and confirm the curve, then run digitization to render the survival curve.")
 
     with tabs[1]:
         st.subheader("Read at-risk table from figure")
