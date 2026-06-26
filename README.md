@@ -1,19 +1,22 @@
-# 🎈 Blank app template
+# SurvExtrapolate AI Trial Suite
 
-A simple Streamlit app template for you to modify!
+A Streamlit prototype for clinical survival digitization, parametric extrapolation, treatment-effect adjustment, registry validation, and health-economic partitioned survival modelling.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+## Features
 
-### How to run it on your own machine
+- Trial login scaffold with GDPR-oriented privacy controls and local trial-session access.
+- Kaplan-Meier figure upload workflow with automatic digitization after a user selects or highlights a line.
+- At-risk table capture with treatment-arm mapping.
+- Parametric survival fitting for exponential, Weibull, log-normal, log-logistic, gamma-like, Gompertz, and weighted-model workflows.
+- Relative-risk, background mortality, and constant hazard increase/decrease adjustments.
+- Standard-error estimates, AIC/BIC comparison, follow-up uncertainty controls, and optional registry comparison.
+- Built-in AI troubleshooting assistant for calibration, digitization, at-risk, and extrapolation problems.
+- Partitioned survival economic modelling with progression-free, post-progression, death, discontinuation, QALY, disutility, cost, and optional Markov-state extension controls.
+- Excel, TreeAge-ready CSV, and R script export.
 
-1. Install the requirements
+## Run locally
 
-   ```
-   $ pip install -r requirements.txt
-   ```
-
-2. Run the app
-
-   ```
-   $ streamlit run streamlit_app.py
-   ```
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
